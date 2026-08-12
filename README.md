@@ -48,7 +48,7 @@ fp16 rule of thumb from measurements on two GPUs: it helps large kernels (29% on
 Requires Unity 6 (URP 17, Render Graph). Add via Package Manager as a git URL or a local folder:
 
 ```
-https://github.com/saivs/unity-sgsr-optimized.git
+https://github.com/saivs/com.saivs.sgsr2-optimized.git
 ```
 
 The Runtime code compiles into the URP runtime assembly through an `.asmref`. This is what makes the package work with stock URP: the fused path needs two internal URP entry points (`SwitchActiveTexturesToBackbuffer` to replace the final blit, `GetFinalBlitScaleBias` for backbuffer orientation). No URP source modifications, no fork.
