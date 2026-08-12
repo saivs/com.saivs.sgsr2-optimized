@@ -6,18 +6,18 @@ The faithful port of the reference costs 40 ms on an Adreno 610 at 2400x1080 (Re
 
 ## Results
 
-Adreno 610 (Snapdragon 685, Redmi Note 12), output 2400x1080, Render Scale 0.5, static camera. Each row uses the best precision for that kernel, all rows measured in one run on a cooled device:
+Output 2400x1080, Render Scale 0.5, static camera. Each cell uses the best precision for that kernel on that GPU; every column is one run on a cooled device. Devices: Adreno 610 (Snapdragon 685, Redmi Note 12) and Adreno 660 (Snapdragon 888):
 
-| Variant | Time |
-|---|---|
-| Reference port, 2 compute passes | 40 ms |
-| Fused fragment: the upscale is the final blit, fp16 | 31.9 ms |
-| Lite: 5 taps, fp16 | 15.1 ms |
-| Ultra: guides prepass + 2 fetches per pixel, fp32 | 10.1 ms |
+| Variant | Adreno 610 | Adreno 660 |
+|---|---|---|
+| Reference port, 2 compute passes | 40 ms | 7.9 ms |
+| Fused fragment: the upscale is the final blit, fp16 | 31.9 ms | 7.4 ms |
+| Lite: 5 taps, fp16 | 15.1 ms | 3.6 ms |
+| Ultra: guides prepass + 2 fetches per pixel, fp32 | 10.1 ms | 3.2 ms |
 
-Passthrough floor (one bilinear tap in the same pass structure, the theoretical minimum of any upscaler): 2 ms. The final kernel is one texture fetch away from it, and that fetch is the history read, which is the temporal algorithm itself.
+Passthrough floor on the Adreno 610 (one bilinear tap in the same pass structure, the theoretical minimum of any upscaler): 2 ms. The final kernel is one texture fetch away from it, and that fetch is the history read, which is the temporal algorithm itself.
 
-Adreno 660 (Snapdragon 888) for scale: reference 7.9 ms, Lite fp16 3.6 ms, Ultra 3.2 ms at Render Scale 0.5; at native scale (pure anti-aliasing) Lite runs at 3.0 ms.
+At native scale (pure temporal anti-aliasing, no upscale) Lite runs at 3.0 ms on the Adreno 660. Note how the gap between Lite and Ultra narrows on the faster GPU: the fixed cost of the guides prepass grows in relative weight, which is exactly why the kernel choice is a per-device decision.
 
 ## What is inside
 
