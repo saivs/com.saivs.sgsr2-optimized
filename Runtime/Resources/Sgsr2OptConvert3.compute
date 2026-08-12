@@ -1,0 +1,89 @@
+// Faithful port of the reference 3-pass compute variant, pass 1 of 3:
+// glsl_3_pass_cs/sgsr2_convert.comp. Dilated nearest depth + camera motion
+// + tonemapped YCoCg pack + transparency reactivity mask (final color vs
+// opaque-only color delta). Adaptations, consistent with this package:
+// reversed-Z (nearest = max), velocity input removed. When no opaque
+// texture is available, bind the final color to both inputs: the delta and
+// the mask collapse to zero.
+//
+// Derived from github.com/SnapdragonGameStudios/snapdragon-gsr (BSD-3):
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+#pragma kernel Convert3
+
+Texture2D<float4> _InputColor;
+Texture2D<float4> _InputOpaqueColor;
+Texture2D<float>  _InputDepth;
+RWTexture2D<uint>   _YCoCgColor;
+RWTexture2D<float4> _MotionDepthAlphaBuffer;
+
+SamplerState sgsr_point_clamp_sampler;
+
+float4 _RenderSizeInfo;   // xy = render size, zw = 1 / render size
+float4 _DisplaySizeInfo;
+float4 _JitterOffset;
+float4 _SgsrParams;       // x = preExposure, y = cameraFovAngleHor
+float4 _ClipToPrevClip0;
+float4 _ClipToPrevClip1;
+float4 _ClipToPrevClip2;
+float4 _ClipToPrevClip3;
+
+[numthreads(8, 8, 1)]
+void Convert3(uint3 id : SV_DispatchThreadID)
+{
+    float2 renderSizeRcp = _RenderSizeInfo.zw;
+    uint2 InputPos = id.xy;
+    if (any(InputPos >= (uint2)_RenderSizeInfo.xy))
+        return;
+
+    float2 gatherCoord = float2(InputPos) * renderSizeRcp;
+    float2 ViewportUV = gatherCoord + 0.5 * renderSizeRcp;
+
+    // FindNearestDepth. Reversed-Z: the reference takes min everywhere.
+    int2 maxPos = int2(_RenderSizeInfo.xy) - 1;
+    int2 InputPosBtmRight = min(int2(InputPos) + 1, maxPos);
+    float NearestZ = _InputDepth.Load(int3(InputPosBtmRight, 0)).x;
+    float4 topleft = _InputDepth.GatherRed(sgsr_point_clamp_sampler, gatherCoord);
+    NearestZ = max(topleft.x, NearestZ);
+    NearestZ = max(topleft.y, NearestZ);
+    NearestZ = max(topleft.z, NearestZ);
+    NearestZ = max(topleft.w, NearestZ);
+
+    float2 topRight = _InputDepth.GatherRed(sgsr_point_clamp_sampler, gatherCoord + float2(renderSizeRcp.x, 0.0)).yz;
+    NearestZ = max(topRight.x, NearestZ);
+    NearestZ = max(topRight.y, NearestZ);
+
+    float2 bottomLeft = _InputDepth.GatherRed(sgsr_point_clamp_sampler, gatherCoord + float2(0.0, renderSizeRcp.y)).xy;
+    NearestZ = max(bottomLeft.x, NearestZ);
+    NearestZ = max(bottomLeft.y, NearestZ);
+
+    float2 ScreenPos = 2.0 * ViewportUV - 1.0;
+    float4 PreClip = _ClipToPrevClip3 + ((_ClipToPrevClip2 * NearestZ) +
+        ((_ClipToPrevClip1 * ScreenPos.y) + (_ClipToPrevClip0 * ScreenPos.x)));
+    float2 PreScreen = PreClip.xy / PreClip.w;
+    float2 motion = ScreenPos - PreScreen;
+
+    // Luma: simple tonemap + YCoCg, packed 11/11/10.
+    float h0 = _SgsrParams.x;
+    float3 Colorrgb = _InputColor.Load(int3(InputPos, 0)).xyz;
+    Colorrgb /= max(max(Colorrgb.x, Colorrgb.y), Colorrgb.z) + h0;
+
+    float3 Colorycocg;
+    Colorycocg.x = 0.25 * (Colorrgb.x + 2.0 * Colorrgb.y + Colorrgb.z);
+    Colorycocg.y = saturate(0.5 * Colorrgb.x + 0.5 - 0.5 * Colorrgb.z);
+    Colorycocg.z = saturate(Colorycocg.x + Colorycocg.y - Colorrgb.x);
+
+    uint x11 = (uint)(Colorycocg.x * 2047.5);
+    uint y11 = (uint)(Colorycocg.y * 2047.5);
+    uint z10 = (uint)(Colorycocg.z * 1023.5);
+
+    // Reactivity: final color vs opaque-only color.
+    float3 Colorprergb = _InputOpaqueColor.Load(int3(InputPos, 0)).xyz;
+    Colorprergb /= max(max(Colorprergb.x, Colorprergb.y), Colorprergb.z) + h0;
+    float3 delta = abs(Colorrgb - Colorprergb);
+    float alpha_mask = max(delta.x, max(delta.y, delta.z));
+    alpha_mask = (0.35 * 1000.0) * alpha_mask;
+
+    _YCoCgColor[InputPos] = ((x11 << 21u) | (y11 << 10u)) | z10;
+    _MotionDepthAlphaBuffer[InputPos] = float4(motion, NearestZ, alpha_mask);
+}

@@ -1,0 +1,120 @@
+// Snapdragon Game Super Resolution 2 — convert pass (2-pass compute variant).
+// HLSL port of sgsr2_convert.comp from github.com/SnapdragonGameStudios/snapdragon-gsr.
+//
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+//
+// Deviations from the GL reference:
+//  - The velocity texture input is removed: motion is always reconstructed
+//    from depth through _ClipToPrevClip (camera-only motion; per-object
+//    motion vectors can be reintroduced later).
+//  - Reversed-Z: "nearest" depth selection is max() instead of min(), the
+//    far-plane guard tests against 0 instead of 1, and the FSR2-derived
+//    depth-separation factor uses the raw reversed depth as nearness.
+
+#pragma kernel Convert
+#pragma multi_compile __ SGSR_FP16
+
+// V1: half precision on the color path. Coordinates, depth and motion stay
+// fp32 — depth comparisons and NDC deltas do not survive fp16.
+#if defined(SGSR_FP16)
+#define hfloat  min16float
+#define hfloat3 min16float3
+#else
+#define hfloat  float
+#define hfloat3 float3
+#endif
+
+Texture2D<float4> _InputColor;
+Texture2D<float>  _InputDepth;
+RWTexture2D<float4> _MotionDepthClipAlphaBuffer;
+RWTexture2D<uint>   _YCoCgColor;
+
+SamplerState sgsr_point_clamp_sampler;
+
+float4 _RenderSizeInfo;   // xy = render size, zw = 1 / render size
+float4 _DisplaySizeInfo;  // xy = display size, zw = 1 / display size
+float4 _JitterOffset;     // xy = jitter in render pixels
+float4 _ClipToPrevClip0;  // columns of prevVP * inverse(curVP)
+float4 _ClipToPrevClip1;
+float4 _ClipToPrevClip2;
+float4 _ClipToPrevClip3;
+float4 _SgsrParams;       // x = preExposure, y = cameraFovAngleHor, z = minLerpContribution, w = unused
+
+[numthreads(8, 8, 1)]
+void Convert(uint3 id : SV_DispatchThreadID)
+{
+    uint2 renderSize = (uint2)_RenderSizeInfo.xy;
+    if (any(id.xy >= renderSize))
+        return;
+
+    float ExposureCoRcp = _SgsrParams.x;
+    float2 ViewportSizeInverse = _RenderSizeInfo.zw;
+    uint2 InputPos = id.xy;
+
+    float2 gatherCoord = float2(id.xy) * ViewportSizeInverse;
+    float2 ViewportUV = gatherCoord + 0.5 * ViewportSizeInverse;
+
+    // FindNearestDepth, derived from FSR2. Reversed-Z: nearest = max.
+    float4 topleft = _InputDepth.GatherRed(sgsr_point_clamp_sampler, gatherCoord);
+    float2 v10 = float2(ViewportSizeInverse.x * 2.0, 0.0);
+    float4 topRight = _InputDepth.GatherRed(sgsr_point_clamp_sampler, gatherCoord + v10);
+    float2 v12 = float2(0.0, ViewportSizeInverse.y * 2.0);
+    float4 bottomLeft = _InputDepth.GatherRed(sgsr_point_clamp_sampler, gatherCoord + v12);
+    float2 v14 = float2(ViewportSizeInverse.x * 2.0, ViewportSizeInverse.y * 2.0);
+    float4 bottomRight = _InputDepth.GatherRed(sgsr_point_clamp_sampler, gatherCoord + v14);
+
+    float maxC = max(max(max(topleft.y, topRight.x), bottomLeft.z), bottomRight.w);
+    float topleft4 = max(max(max(topleft.y, topleft.x), topleft.z), topleft.w);
+    float topLeftMax9 = max(bottomLeft.w, max(max(maxC, topleft4), topRight.w));
+
+    float depthclip = 0.0;
+    if (maxC > 1.0e-05f) // reversed-Z far plane is 0
+    {
+        float topRight4 = max(max(max(topRight.y, topRight.x), topRight.z), topRight.w);
+        float bottomLeft4 = max(max(max(bottomLeft.y, bottomLeft.x), bottomLeft.z), bottomLeft.w);
+        float bottomRight4 = max(max(max(bottomRight.y, bottomRight.x), bottomRight.z), bottomRight.w);
+
+        float Wdepth = 0.0;
+        float Ksep = 1.37e-05f;
+        float Kfov = _SgsrParams.y;
+        float diagonal_length = length(_RenderSizeInfo.xy);
+        float Ksep_Kfov_diagonal = Ksep * Kfov * diagonal_length;
+
+        // Reversed-Z: raw depth is already "nearness" (1 near, 0 far).
+        float Depthsep = Ksep_Kfov_diagonal * maxC;
+        float EPSILON = 1.19e-07f;
+        Wdepth += saturate(Depthsep / (abs(maxC - topleft4) + EPSILON));
+        Wdepth += saturate(Depthsep / (abs(maxC - topRight4) + EPSILON));
+        Wdepth += saturate(Depthsep / (abs(maxC - bottomLeft4) + EPSILON));
+        Wdepth += saturate(Depthsep / (abs(maxC - bottomRight4) + EPSILON));
+        depthclip = saturate(1.0f - Wdepth * 0.25);
+    }
+
+    // Camera-only motion: reconstruct from dilated depth and the
+    // current-to-previous clip transform (the FSR2 velocity path is removed).
+    float2 ScreenPos = 2.0f * ViewportUV - 1.0f;
+    float3 Position = float3(ScreenPos, topLeftMax9);
+    float4 PreClip = _ClipToPrevClip3 + ((_ClipToPrevClip2 * Position.z) +
+        ((_ClipToPrevClip1 * ScreenPos.y) + (_ClipToPrevClip0 * ScreenPos.x)));
+    float2 PreScreen = PreClip.xy / PreClip.w;
+    float2 motion = Position.xy - PreScreen;
+
+    // Luma + simple max-component tonemap into [0,1]. The reference runs
+    // this at mediump too; ColorMax stays fp32 (HDR range).
+    float3 inColor = _InputColor[InputPos].xyz;
+    float ColorMax = max(max(inColor.x, inColor.y), inColor.z) + ExposureCoRcp;
+    hfloat3 Colorrgb = (hfloat3)(inColor / ColorMax);
+
+    hfloat3 Colorycocg;
+    Colorycocg.x = hfloat(0.25) * (Colorrgb.x + hfloat(2.0) * Colorrgb.y + Colorrgb.z);
+    Colorycocg.y = saturate(hfloat(0.5) * Colorrgb.x + hfloat(0.5) - hfloat(0.5) * Colorrgb.z);
+    Colorycocg.z = saturate(Colorycocg.x + Colorycocg.y - Colorrgb.x);
+
+    uint x11 = (uint)(float(Colorycocg.x) * 2047.5);
+    uint y11 = (uint)(float(Colorycocg.y) * 2047.5);
+    uint z10 = (uint)(float(Colorycocg.z) * 1023.5);
+
+    _YCoCgColor[id.xy] = ((x11 << 21u) | (y11 << 10u)) | z10;
+    _MotionDepthClipAlphaBuffer[id.xy] = float4(motion, depthclip, ColorMax);
+}

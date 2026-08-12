@@ -1,0 +1,134 @@
+// Faithful port of the reference 3-pass compute variant, pass 2 of 3:
+// glsl_3_pass_cs/sgsr2_activate.comp. Depth-clip against the REPROJECTED
+// previous frame depth (bilinear-weighted 3x3 neighborhood of dilated
+// depth), plus a two-frame luma stability history. Adaptations: reversed-Z
+// (nearest = max, guard against the 0 far plane, nearness = raw depth).
+//
+// Derived from github.com/SnapdragonGameStudios/snapdragon-gsr (BSD-3):
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+#pragma kernel Activate3
+
+#define EPSILON 1.19e-07
+
+Texture2D<uint>   _PrevLumaHistory;
+Texture2D<float4> _MotionDepthAlphaBuffer;
+Texture2D<uint>   _YCoCgColor;
+RWTexture2D<float4> _MotionDepthClipAlphaBuffer;
+RWTexture2D<uint>   _LumaHistory;
+
+SamplerState sgsr_point_clamp_sampler;
+SamplerState sgsr_linear_clamp_sampler;
+
+float4 _RenderSizeInfo;   // xy = render size, zw = 1 / render size
+float4 _DisplaySizeInfo;
+float4 _SgsrParams;       // y = cameraFovAngleHor
+int    _Reset;
+
+float DecodeColorY(uint sample32)
+{
+    uint x11 = sample32 >> 21u;
+    return float(x11) * (1.0 / 2047.5);
+}
+
+[numthreads(8, 8, 1)]
+void Activate3(uint3 id : SV_DispatchThreadID)
+{
+    const int2 sampleOffset[4] =
+    {
+        int2(-1, -1),
+        int2(-1,  0),
+        int2( 0, -1),
+        int2( 0,  0),
+    };
+
+    uint2 InputPos = id.xy;
+    if (any(InputPos >= (uint2)_RenderSizeInfo.xy))
+        return;
+
+    float2 renderSizeRcp = _RenderSizeInfo.zw;
+    float2 ViewportUV = (float2(InputPos) + 0.5) * renderSizeRcp;
+    float2 gatherCoord = ViewportUV + 0.5 * renderSizeRcp;
+    uint luma_reference32 = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord).w;
+    float luma_reference = DecodeColorY(luma_reference32);
+
+    float4 mda = _MotionDepthAlphaBuffer.Load(int3(InputPos, 0));
+    float depth = mda.z;
+    float alphamask = mda.w;
+    float2 motion = mda.xy;
+
+    float2 PrevUV = float2(-0.5 * motion.x + ViewportUV.x, -0.5 * motion.y + ViewportUV.y);
+
+    float depthclip = 0.0;
+    // Reversed-Z far-plane guard (reference: depth < 1 - 1e-5).
+    if (depth > 1.0e-05)
+    {
+        float2 Prevf_sample = PrevUV * _RenderSizeInfo.xy - 0.5;
+        float2 Prevfrac = Prevf_sample - floor(Prevf_sample);
+        float OneMinusPrevfacx = 1.0 - Prevfrac.x;
+
+        float Bilinweights[4] =
+        {
+            OneMinusPrevfacx - OneMinusPrevfacx * Prevfrac.y,
+            Prevfrac.x - Prevfrac.x * Prevfrac.y,
+            OneMinusPrevfacx * Prevfrac.y,
+            Prevfrac.x * Prevfrac.y,
+        };
+
+        float Wdepth = 0.0;
+        float Ksep_Kfov_diagonal = 1.37e-05 * _SgsrParams.y * length(_RenderSizeInfo.xy);
+        [unroll]
+        for (int index = 0; index < 4; index += 2)
+        {
+            // Reversed-Z: nearest of the gathered quad is max (reference: min),
+            // and nearness is the raw depth (reference: 1 - min(prev, cur)).
+            float4 gPrevdepth = _MotionDepthAlphaBuffer.GatherBlue(sgsr_linear_clamp_sampler, PrevUV, sampleOffset[index]);
+            float tdepth1 = max(gPrevdepth.x, gPrevdepth.y);
+            float tdepth2 = max(gPrevdepth.z, gPrevdepth.w);
+            float fPrevdepth = max(tdepth1, tdepth2);
+
+            float Depthsep = Ksep_Kfov_diagonal * max(fPrevdepth, depth);
+            float weight = Bilinweights[index];
+            Wdepth += saturate(Depthsep / (abs(fPrevdepth - depth) + EPSILON)) * weight;
+
+            float2 gPrevdepth2 = _MotionDepthAlphaBuffer.GatherBlue(sgsr_linear_clamp_sampler, PrevUV, sampleOffset[index + 1]).zw;
+            fPrevdepth = max(max(gPrevdepth2.x, gPrevdepth2.y), tdepth2);
+            Depthsep = Ksep_Kfov_diagonal * max(fPrevdepth, depth);
+            weight = Bilinweights[index + 1];
+            Wdepth += saturate(Depthsep / (abs(fPrevdepth - depth) + EPSILON)) * weight;
+        }
+        depthclip = saturate(1.0 - Wdepth);
+    }
+
+    float2 current_luma_diff;
+    uint prev_luma_diff_pack = _PrevLumaHistory.GatherRed(sgsr_point_clamp_sampler, PrevUV).w;
+    float2 prev_luma_diff;
+    prev_luma_diff.x = f16tof32(prev_luma_diff_pack >> 16u);
+    prev_luma_diff.y = f16tof32(prev_luma_diff_pack & 0xFFFFu);
+
+    bool enable = false;
+    if (depthclip + float(_Reset) < 0.1)
+    {
+        enable = all(PrevUV >= 0.0) && all(PrevUV <= 1.0);
+    }
+    float luma_diff = luma_reference - prev_luma_diff.x;
+    if (!enable)
+    {
+        current_luma_diff.x = 0.0;
+        current_luma_diff.y = 0.0;
+    }
+    else
+    {
+        current_luma_diff.x = luma_reference;
+        current_luma_diff.y = (prev_luma_diff.y != 0.0)
+            ? ((sign(luma_diff) == sign(prev_luma_diff.y))
+                ? (sign(luma_diff) * min(abs(prev_luma_diff.y), abs(luma_diff)))
+                : prev_luma_diff.y)
+            : luma_diff;
+    }
+
+    alphamask = floor(alphamask) + 0.5 * float((current_luma_diff.x != 0.0) && (abs(current_luma_diff.y) != abs(luma_diff)));
+    uint pack = (f32tof16(current_luma_diff.x) << 16u) | f32tof16(current_luma_diff.y);
+    _LumaHistory[InputPos] = pack;
+    _MotionDepthClipAlphaBuffer[InputPos] = float4(motion, depthclip, alphamask);
+}

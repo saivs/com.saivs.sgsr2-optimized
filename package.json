@@ -1,0 +1,29 @@
+{
+  "name": "com.saivs.sgsr2-optimized",
+  "version": "1.0.0",
+  "displayName": "SGSR2 Optimized",
+  "description": "Snapdragon Game Super Resolution 2 for Unity URP, optimized for low-tier mobile GPUs. No TAA dependency: the feature applies its own camera jitter and reconstructs motion from depth. Ships a kernel ladder (reference compute port, fused fragment, Lite, Ultra) with runtime toggles for on-device A/B comparison.",
+  "unity": "6000.0",
+  "keywords": [
+    "upscaling",
+    "sgsr",
+    "taau",
+    "urp",
+    "mobile"
+  ],
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.0.0"
+  },
+  "license": "BSD-3-Clause",
+  "author": {
+    "name": "Denis Zhukov",
+    "url": "https://github.com/saivs"
+  },
+  "samples": [
+    {
+      "displayName": "Comparison HUD",
+      "description": "Runtime panel with kernel toggles and GPU timings for on-device A/B.",
+      "path": "Samples~/ComparisonHud"
+    }
+  ]
+}

@@ -1,0 +1,250 @@
+// Snapdragon Game Super Resolution 2 — upscale pass (2-pass compute variant).
+// HLSL port of sgsr2_upscale.comp from github.com/SnapdragonGameStudios/snapdragon-gsr.
+//
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+
+#pragma kernel Upscale
+#pragma multi_compile __ SGSR_FP16
+
+// V1: half precision on colors, weights and blend factors. Everything
+// derived from screen coordinates stays fp32 — srcpos-style differences of
+// large values cancel catastrophically in fp16.
+#if defined(SGSR_FP16)
+#define hfloat  min16float
+#define hfloat2 min16float2
+#define hfloat3 min16float3
+#define hfloat4 min16float4
+#else
+#define hfloat  float
+#define hfloat2 float2
+#define hfloat3 float3
+#define hfloat4 float4
+#endif
+
+Texture2D<float4> _PrevHistoryOutput;
+Texture2D<float4> _MotionDepthClipAlphaBuffer;
+Texture2D<uint>   _YCoCgColor;
+RWTexture2D<float4> _SceneColorOutput;
+RWTexture2D<float4> _HistoryOutput;
+
+SamplerState sgsr_linear_clamp_sampler;
+SamplerState sgsr_point_clamp_sampler;
+
+float4 _RenderSizeInfo;   // xy = render size, zw = 1 / render size
+float4 _DisplaySizeInfo;  // xy = display size, zw = 1 / display size
+float4 _JitterOffset;     // xy = jitter in render pixels
+float4 _SgsrParams;       // x = preExposure, y = cameraFovAngleHor, z = minLerpContribution, w = unused
+int _SameCameraFrmNum;    // nonzero while the camera is still
+int _Reset;               // 1 = drop history (first frame / resize)
+
+hfloat FastLanczos(hfloat base)
+{
+    hfloat y = base - hfloat(1.0);
+    hfloat y2 = y * y;
+    hfloat y_temp = hfloat(0.75) * y + y2;
+    return y_temp * y2;
+}
+
+hfloat3 DecodeColor(uint sample32)
+{
+    uint x11 = sample32 >> 21u;
+    uint y11 = sample32 & (2047u << 10u);
+    uint z10 = sample32 & 1023u;
+    hfloat3 samplecolor;
+    samplecolor.x = hfloat(float(x11) * (1.0 / 2047.5));
+    samplecolor.y = hfloat((float(y11) * (4.76953602e-7)) - 0.5);
+    samplecolor.z = hfloat((float(z10) * (1.0 / 1023.5)) - 0.5);
+    return samplecolor;
+}
+
+// The pixel-space delta is cast to fp16 ONCE before the sample loop (it is
+// a small local difference, safe in half); every dot/exp below then runs in
+// a single precision with no per-sample conversions.
+#define BOX_SAMPLE(sampleuint, offsx, offsy) \
+    { \
+        hfloat3 samplecolor = DecodeColor(sampleuint); \
+        hfloat2 baseoffset = srcDelta + hfloat2(offsx, offsy); \
+        hfloat baseoffset_dot = dot(baseoffset, baseoffset); \
+        hfloat base = saturate(baseoffset_dot * hKernelbias2); \
+        hfloat weight = FastLanczos(base); \
+        Upsampledcw += hfloat4(samplecolor * weight, weight); \
+        hfloat boxweight = exp(baseoffset_dot * hCurvebias); \
+        rectboxmin = min(rectboxmin, samplecolor); \
+        rectboxmax = max(rectboxmax, samplecolor); \
+        hfloat3 wsample = samplecolor * boxweight; \
+        rectboxcenter += wsample; \
+        rectboxvar += (samplecolor * wsample); \
+        rectboxweight += boxweight; \
+    }
+
+[numthreads(8, 8, 1)]
+void Upscale(uint3 id : SV_DispatchThreadID)
+{
+    float2 displaySize = _DisplaySizeInfo.xy;
+    if (any(id.xy >= (uint2)displaySize))
+        return;
+
+    float2 renderSize = _RenderSizeInfo.xy;
+    float2 renderSizeRcp = _RenderSizeInfo.zw;
+
+    float Biasmax_viewportXScale = min(displaySize.x / renderSize.x, 1.99);
+    hfloat scalefactor = (hfloat)min(20.0, pow((displaySize.x / renderSize.x) * (displaySize.y / renderSize.y), 3.0));
+    float2 HistoryInfoViewportSizeInverse = _DisplaySizeInfo.zw;
+    float2 HistoryInfoViewportSize = displaySize;
+    float2 InputJitter = _JitterOffset.xy;
+    float2 InputInfoViewportSize = renderSize;
+    float2 Hruv = (float2(id.xy) + 0.5) * HistoryInfoViewportSizeInverse;
+    float2 Jitteruv;
+    Jitteruv.x = saturate(Hruv.x + (InputJitter.x * renderSizeRcp.x));
+    Jitteruv.y = saturate(Hruv.y + (InputJitter.y * renderSizeRcp.y));
+
+    // Clamped: saturate(Jitteruv) reaches exactly 1.0 at the right/bottom
+    // edge and the truncated index lands one texel out of range.
+    int2 InputPos = min(int2(Jitteruv * InputInfoViewportSize), int2(InputInfoViewportSize) - 1);
+    float4 mda = _MotionDepthClipAlphaBuffer.SampleLevel(sgsr_linear_clamp_sampler, Jitteruv, 0.0);
+    float2 Motion = mda.xy;
+
+    float2 PrevUV;
+    PrevUV.x = saturate(-0.5 * Motion.x + Hruv.x);
+    PrevUV.y = saturate(-0.5 * Motion.y + Hruv.y);
+
+    hfloat depthfactor = (hfloat)mda.z;
+    float ColorMax = mda.w;
+
+    float4 History = _PrevHistoryOutput.SampleLevel(sgsr_linear_clamp_sampler, PrevUV, 0.0);
+    hfloat3 HistoryColor = (hfloat3)History.xyz;
+    hfloat Wfactor = (hfloat)saturate(abs(History.w));
+
+    // Upsample and compute the rectification box.
+    hfloat4 Upsampledcw = hfloat4(0.0, 0.0, 0.0, 0.0);
+    hfloat kernelfactor = saturate(Wfactor + hfloat(_Reset));
+    hfloat biasmax = hfloat(Biasmax_viewportXScale) - hfloat(Biasmax_viewportXScale) * kernelfactor;
+    hfloat biasmin = max(hfloat(1.0), hfloat(0.3) + hfloat(0.3) * biasmax);
+    hfloat biasfactor = max(hfloat(0.25) * depthfactor, kernelfactor);
+    float kernelbias = lerp(biasmax, biasmin, biasfactor);
+    float motion_viewport_len = length(Motion * HistoryInfoViewportSize);
+    float curvebias = lerp(-2.0, -3.0, saturate(motion_viewport_len * 0.02));
+
+    hfloat3 rectboxcenter = hfloat3(0.0, 0.0, 0.0);
+    hfloat3 rectboxvar = hfloat3(0.0, 0.0, 0.0);
+    hfloat rectboxweight = hfloat(0.0);
+    float2 srcpos = float2(InputPos) + 0.5 - InputJitter;
+    float2 srcOutputPos = Hruv * InputInfoViewportSize;
+
+    kernelbias *= 0.5f;
+    float kernelbias2 = kernelbias * kernelbias;
+    float2 srcpos_srcOutputPos = srcpos - srcOutputPos;
+
+    // Single fp32 -> fp16 boundary for the sample loop.
+    hfloat2 srcDelta = (hfloat2)srcpos_srcOutputPos;
+    hfloat hKernelbias2 = (hfloat)kernelbias2;
+    hfloat hCurvebias = (hfloat)curvebias;
+
+    int2 InputPosBtmRight = int2(1, 1) + InputPos;
+    float2 gatherCoord = float2(InputPos) * renderSizeRcp;
+    uint btmRight = _YCoCgColor[InputPosBtmRight];
+    uint4 topleft = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord);
+    uint2 topRight;
+    uint2 bottomLeft;
+
+    uint sameCameraFrmNum = (uint)_SameCameraFrmNum;
+
+    if (sameCameraFrmNum != 0u)
+    {
+        topRight = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord + float2(renderSizeRcp.x, 0.0)).yz;
+        bottomLeft = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord + float2(0.0, renderSizeRcp.y)).xy;
+    }
+    else
+    {
+        uint2 btmRight2 = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord + float2(renderSizeRcp.x, renderSizeRcp.y)).xz;
+        bottomLeft.y = btmRight2.x;
+        topRight.x = btmRight2.y;
+        bottomLeft.x = 0u;
+        topRight.y = 0u;
+    }
+
+    hfloat3 rectboxmin;
+    hfloat3 rectboxmax;
+    {
+        hfloat3 samplecolor = DecodeColor(bottomLeft.y);
+        hfloat2 baseoffset = srcDelta + hfloat2(0.0, 1.0);
+        hfloat baseoffset_dot = dot(baseoffset, baseoffset);
+        hfloat base = saturate(baseoffset_dot * hKernelbias2);
+        hfloat weight = FastLanczos(base);
+        Upsampledcw += hfloat4(samplecolor * weight, weight);
+        hfloat boxweight = exp(baseoffset_dot * hCurvebias);
+        rectboxmin = samplecolor;
+        rectboxmax = samplecolor;
+        hfloat3 wsample = samplecolor * boxweight;
+        rectboxcenter += wsample;
+        rectboxvar += (samplecolor * wsample);
+        rectboxweight += boxweight;
+    }
+    BOX_SAMPLE(topRight.x,  1.0,  0.0)
+    BOX_SAMPLE(topleft.x,  -1.0,  0.0)
+    BOX_SAMPLE(topleft.y,   0.0,  0.0)
+    BOX_SAMPLE(topleft.z,   0.0, -1.0)
+
+    if (sameCameraFrmNum != 0u)
+    {
+        BOX_SAMPLE(btmRight,      1.0,  1.0)
+        BOX_SAMPLE(bottomLeft.x, -1.0,  1.0)
+        BOX_SAMPLE(topRight.y,    1.0, -1.0)
+        BOX_SAMPLE(topleft.w,    -1.0, -1.0)
+    }
+
+    hfloat rectboxweightRcp = hfloat(1.0) / rectboxweight;
+    rectboxcenter *= rectboxweightRcp;
+    rectboxvar *= rectboxweightRcp;
+    rectboxvar = sqrt(abs(rectboxvar - rectboxcenter * rectboxcenter));
+
+    Upsampledcw.xyz = clamp(Upsampledcw.xyz / Upsampledcw.w, rectboxmin - hfloat(0.05), rectboxmax + hfloat(0.05));
+    Upsampledcw.w = Upsampledcw.w * hfloat(1.0 / 3.0);
+
+    hfloat OneMinusWfactor = hfloat(1.0) - Wfactor;
+
+    hfloat baseupdate = OneMinusWfactor - OneMinusWfactor * depthfactor;
+    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w * hfloat(10.0), (hfloat)saturate(10.0 * motion_viewport_len)));
+    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w, (hfloat)saturate(motion_viewport_len * 0.05)));
+    hfloat basealpha = baseupdate;
+
+    const hfloat EPSILON = hfloat(1.192e-07);
+    hfloat boxscale = max(depthfactor, (hfloat)saturate(motion_viewport_len * 0.05));
+    hfloat boxsize = lerp(scalefactor, hfloat(1.0), boxscale);
+    hfloat3 sboxvar = rectboxvar * boxsize;
+    hfloat3 boxmin = rectboxcenter - sboxvar;
+    hfloat3 boxmax = rectboxcenter + sboxvar;
+    rectboxmax = min(rectboxmax, boxmax);
+    rectboxmin = max(rectboxmin, boxmin);
+
+    hfloat3 clampedcolor = clamp(HistoryColor, rectboxmin, rectboxmax);
+    hfloat startLerpValue = (hfloat)_SgsrParams.z;
+    if ((abs(mda.x) + abs(mda.y)) > 0.000001) startLerpValue = hfloat(0.0);
+    hfloat lerpcontribution = (any(rectboxmin > HistoryColor) || any(HistoryColor > rectboxmax)) ? startLerpValue : hfloat(1.0);
+
+    HistoryColor = lerp(clampedcolor, HistoryColor, saturate(lerpcontribution));
+    hfloat basemin = min(basealpha, hfloat(0.1));
+    basealpha = lerp(basemin, basealpha, saturate(lerpcontribution));
+
+    // Blend color.
+    hfloat alphasum = max(EPSILON, basealpha + Upsampledcw.w);
+    hfloat alpha = saturate(Upsampledcw.w / alphasum + hfloat(_Reset));
+    Upsampledcw.xyz = lerp(HistoryColor, Upsampledcw.xyz, alpha);
+
+    _HistoryOutput[id.xy] = float4(Upsampledcw.xyz, Wfactor);
+
+    // YCoCg to RGB.
+    hfloat x_z = Upsampledcw.x - Upsampledcw.z;
+    hfloat3 rgb = hfloat3(
+        saturate(x_z + Upsampledcw.y),
+        saturate(Upsampledcw.x + Upsampledcw.z),
+        saturate(x_z - Upsampledcw.y));
+
+    // The un-tonemap scale spans the HDR range — fp32.
+    float compMax = saturate(max(max((float)rgb.x, (float)rgb.y), (float)rgb.z));
+    float scale = _SgsrParams.x / ((1.0f + 600.0f / 65504.0f) - compMax);
+
+    if (ColorMax > 4000.0f) scale = ColorMax;
+    _SceneColorOutput[id.xy] = float4(float3(rgb) * scale, 1.0);
+}

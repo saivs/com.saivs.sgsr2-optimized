@@ -1,0 +1,205 @@
+// Faithful port of the reference 3-pass compute variant, pass 3 of 3:
+// glsl_3_pass_cs/sgsr2_upscale.comp. Gather-based 9-tap YCoCg kernel with
+// the reactivity mask and luma-stability contribution from the activate
+// pass. NDC convention matches the rest of this package (validated by the
+// 2-pass port); no depth logic lives here, so no reversed-Z changes.
+//
+// Derived from github.com/SnapdragonGameStudios/snapdragon-gsr (BSD-3):
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+#pragma kernel Upscale3
+
+Texture2D<float4> _PrevHistoryOutput;
+Texture2D<float4> _MotionDepthClipAlphaBuffer;
+Texture2D<uint>   _YCoCgColor;
+RWTexture2D<float4> _HistoryOutput;
+RWTexture2D<float4> _SceneColorOutput;
+
+SamplerState sgsr_point_clamp_sampler;
+SamplerState sgsr_linear_clamp_sampler;
+
+float4 _RenderSizeInfo;   // xy = render size, zw = 1 / render size
+float4 _DisplaySizeInfo;  // xy = display size, zw = 1 / display size
+float4 _JitterOffset;
+float4 _SgsrParams;       // x = preExposure, z = minLerpContribution
+int    _Reset;
+
+float FastLanczos(float base)
+{
+    float y = base - 1.0;
+    float y2 = y * y;
+    float y_temp = 0.75 * y + y2;
+    return y_temp * y2;
+}
+
+float3 DecodeColor(uint sample32)
+{
+    uint x11 = sample32 >> 21u;
+    uint y11 = sample32 & (2047u << 10u);
+    uint z10 = sample32 & 1023u;
+    float3 samplecolor;
+    samplecolor.x = float(x11) * (1.0 / 2047.5);
+    samplecolor.y = (float(y11) * (4.76953602e-7)) - 0.5;
+    samplecolor.z = (float(z10) * (1.0 / 1023.5)) - 0.5;
+    return samplecolor;
+}
+
+#define BOX_SAMPLE(colorexpr, offsx, offsy) \
+    { \
+        float3 samplecolor = colorexpr; \
+        float2 baseoffset = srcpos_srcOutputPos + float2(offsx, offsy); \
+        float baseoffset_dot = dot(baseoffset, baseoffset); \
+        float base = saturate(baseoffset_dot * kernelbias2); \
+        float weight = FastLanczos(base); \
+        Upsampledcw += float4(samplecolor * weight, weight); \
+        float boxweight = exp(baseoffset_dot * curvebias); \
+        rectboxmin = min(rectboxmin, samplecolor); \
+        rectboxmax = max(rectboxmax, samplecolor); \
+        float3 wsample = samplecolor * boxweight; \
+        rectboxcenter += wsample; \
+        rectboxvar += (samplecolor * wsample); \
+        rectboxweight += boxweight; \
+    }
+
+[numthreads(8, 8, 1)]
+void Upscale3(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)_DisplaySizeInfo.xy))
+        return;
+
+    float2 renderSize = _RenderSizeInfo.xy;
+    float2 renderSizeRcp = _RenderSizeInfo.zw;
+    float2 displaySize = _DisplaySizeInfo.xy;
+
+    float Biasmax_viewportXScale = min(displaySize.x / renderSize.x, 1.99);
+    float scalefactor = min(20.0, pow((displaySize.x / renderSize.x) * (displaySize.y / renderSize.y), 3.0));
+
+    float2 InputJitter = _JitterOffset.xy;
+    float2 Hruv = (float2(id.xy) + 0.5) * _DisplaySizeInfo.zw;
+    float2 Jitteruv;
+    Jitteruv.x = saturate(Hruv.x + (InputJitter.x * renderSizeRcp.x));
+    Jitteruv.y = saturate(Hruv.y + (InputJitter.y * renderSizeRcp.y));
+
+    int2 InputPos = min(int2(Jitteruv * renderSize), int2(renderSize) - 1);
+
+    float alphab = _MotionDepthClipAlphaBuffer.Load(int3(InputPos, 0)).w;
+    float3 mda = _MotionDepthClipAlphaBuffer.SampleLevel(sgsr_linear_clamp_sampler, Jitteruv, 0.0).xyz;
+    float2 Motion = mda.xy;
+
+    float2 PrevUV;
+    PrevUV.x = saturate(-0.5 * Motion.x + Hruv.x);
+    PrevUV.y = saturate(-0.5 * Motion.y + Hruv.y);
+
+    float depthfactor = mda.z;
+    float history_value = frac(alphab);
+    float alphamask = (alphab - history_value) * 0.001;
+    history_value *= 2.0;
+
+    float4 History = _PrevHistoryOutput.SampleLevel(sgsr_linear_clamp_sampler, PrevUV, 0.0);
+    float3 HistoryColor = History.xyz;
+    float Historyw = History.w;
+    float Wfactor = max(saturate(abs(Historyw)), alphamask);
+
+    float4 Upsampledcw = float4(0.0, 0.0, 0.0, 0.0);
+    float kernelfactor = saturate(Wfactor + float(_Reset));
+    float biasmax = Biasmax_viewportXScale - Biasmax_viewportXScale * kernelfactor;
+    float biasmin = max(1.0, 0.3 + 0.3 * biasmax);
+    float biasfactor = max(0.25 * depthfactor, kernelfactor);
+    float kernelbias = lerp(biasmax, biasmin, biasfactor);
+    float motion_viewport_len = length(Motion * displaySize);
+    float curvebias = lerp(-2.0, -3.0, saturate(motion_viewport_len * 0.02));
+
+    float3 rectboxcenter = float3(0.0, 0.0, 0.0);
+    float3 rectboxvar = float3(0.0, 0.0, 0.0);
+    float rectboxweight = 0.0;
+    float2 srcpos = float2(InputPos) + 0.5 - InputJitter;
+    float2 srcOutputPos = Hruv * renderSize;
+
+    kernelbias *= 0.5;
+    float kernelbias2 = kernelbias * kernelbias;
+    float2 srcpos_srcOutputPos = srcpos - srcOutputPos;
+
+    int2 InputPosBtmRight = int2(1, 1) + InputPos;
+    float2 gatherCoord = float2(InputPos) * renderSizeRcp;
+    uint btmRight = _YCoCgColor.Load(int3(min(InputPosBtmRight, int2(renderSize) - 1), 0));
+    uint4 topleft = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord);
+    uint2 topRight = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord + float2(renderSizeRcp.x, 0.0)).yz;
+    uint2 bottomLeft = _YCoCgColor.GatherRed(sgsr_point_clamp_sampler, gatherCoord + float2(0.0, renderSizeRcp.y)).xy;
+
+    float3 rectboxmin;
+    float3 rectboxmax;
+    {
+        rectboxmin = DecodeColor(btmRight);
+        float2 baseoffset = srcpos_srcOutputPos + float2(1.0, 1.0);
+        float baseoffset_dot = dot(baseoffset, baseoffset);
+        float base = saturate(baseoffset_dot * kernelbias2);
+        float weight = FastLanczos(base);
+        Upsampledcw += float4(rectboxmin * weight, weight);
+        float boxweight = exp(baseoffset_dot * curvebias);
+        rectboxmax = rectboxmin;
+        float3 wsample = rectboxmin * boxweight;
+        rectboxcenter = wsample;
+        rectboxvar = rectboxmin * wsample;
+        rectboxweight = boxweight;
+    }
+    BOX_SAMPLE(DecodeColor(bottomLeft.x), -1.0,  1.0)
+    BOX_SAMPLE(DecodeColor(bottomLeft.y),  0.0,  1.0)
+    BOX_SAMPLE(DecodeColor(topRight.x),    1.0,  0.0)
+    BOX_SAMPLE(DecodeColor(topRight.y),    1.0, -1.0)
+    BOX_SAMPLE(DecodeColor(topleft.x),    -1.0,  0.0)
+    BOX_SAMPLE(DecodeColor(topleft.y),     0.0,  0.0)
+    BOX_SAMPLE(DecodeColor(topleft.z),     0.0, -1.0)
+    BOX_SAMPLE(DecodeColor(topleft.w),    -1.0, -1.0)
+
+    rectboxweight = 1.0 / rectboxweight;
+    rectboxcenter *= rectboxweight;
+    rectboxvar *= rectboxweight;
+    rectboxvar = sqrt(abs(rectboxvar - rectboxcenter * rectboxcenter));
+
+    Upsampledcw.xyz = clamp(Upsampledcw.xyz / Upsampledcw.w, rectboxmin - 0.05, rectboxmax + 0.05);
+    Upsampledcw.w = Upsampledcw.w * (1.0 / 3.0);
+
+    float tcontribute = history_value * saturate(rectboxvar.x * 10.0);
+    float OneMinusWfactor = 1.0 - Wfactor;
+    tcontribute = tcontribute * OneMinusWfactor;
+
+    float baseupdate = OneMinusWfactor - OneMinusWfactor * depthfactor;
+    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w * 10.0, saturate(10.0 * motion_viewport_len)));
+    baseupdate = min(baseupdate, lerp(baseupdate, Upsampledcw.w, saturate(motion_viewport_len * 0.05)));
+    float basealpha = baseupdate;
+
+    const float EPSILON = 1.192e-07;
+    float boxscale = max(depthfactor, saturate(motion_viewport_len * 0.05));
+    float boxsize = lerp(scalefactor, 1.0, boxscale);
+    float3 sboxvar = rectboxvar * boxsize;
+    float3 boxmin = rectboxcenter - sboxvar;
+    float3 boxmax = rectboxcenter + sboxvar;
+    rectboxmax = min(rectboxmax, boxmax);
+    rectboxmin = max(rectboxmin, boxmin);
+
+    float3 clampedcolor = clamp(HistoryColor, rectboxmin, rectboxmax);
+    float lerpcontribution = (any(rectboxmin > HistoryColor) || any(HistoryColor > rectboxmax)) ? tcontribute : 1.0;
+    lerpcontribution = lerpcontribution - lerpcontribution * sqrt(alphamask);
+    HistoryColor = lerp(clampedcolor, HistoryColor, saturate(lerpcontribution));
+    float basemin = min(basealpha, 0.1);
+    basealpha = lerp(basemin, basealpha, saturate(lerpcontribution));
+
+    float alphasum = max(EPSILON, basealpha + Upsampledcw.w);
+    float alpha = saturate(Upsampledcw.w / alphasum + float(_Reset));
+    Upsampledcw.xyz = lerp(HistoryColor, Upsampledcw.xyz, alpha);
+
+    _HistoryOutput[id.xy] = float4(Upsampledcw.xyz, Wfactor);
+
+    float x_z = Upsampledcw.x - Upsampledcw.z;
+    Upsampledcw.xyz = float3(
+        x_z + Upsampledcw.y,
+        Upsampledcw.x + Upsampledcw.z,
+        x_z - Upsampledcw.y);
+
+    float compMax = max(Upsampledcw.x, Upsampledcw.y);
+    compMax = max(compMax, Upsampledcw.z);
+    float scale = _SgsrParams.x / ((1.0 + 1.0 / 65504.0) - compMax);
+
+    Upsampledcw.xyz = Upsampledcw.xyz * scale;
+    _SceneColorOutput[id.xy] = Upsampledcw;
+}
