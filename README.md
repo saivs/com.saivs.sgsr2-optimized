@@ -1,4 +1,5 @@
 # SGSR2 Optimized for Unity URP
+![Upscale 4x Example](Upscale_4x.jpg)
 
 Snapdragon Game Super Resolution 2 as a self-contained URP renderer feature, optimized until it became practical on low-tier mobile GPUs. No TAA dependency: the feature applies its own camera jitter and reconstructs motion from depth.
 
