@@ -18,6 +18,7 @@ Shader "Hidden/Sgsr2Optimized/UpscaleFrag"
             ZTest Always ZWrite Off Cull Off Blend Off
 
             HLSLPROGRAM
+            #pragma target 4.5
             #pragma vertex Vert
             #pragma fragment Frag
             #pragma multi_compile_fragment __ SGSR_FP16
@@ -514,6 +515,7 @@ Shader "Hidden/Sgsr2Optimized/UpscaleFrag"
             ZTest Always ZWrite Off Cull Off Blend Off
 
             HLSLPROGRAM
+            #pragma target 4.5
             #pragma vertex Vert
             #pragma fragment FragPack
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
@@ -561,6 +563,7 @@ Shader "Hidden/Sgsr2Optimized/UpscaleFrag"
             ZTest Always ZWrite Off Cull Off Blend Off
 
             HLSLPROGRAM
+            #pragma target 4.5
             #pragma vertex Vert
             #pragma fragment FragGuides
             #pragma multi_compile_fragment __ SGSR_FP16

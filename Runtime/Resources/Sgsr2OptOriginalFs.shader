@@ -61,6 +61,7 @@ Shader "Hidden/Sgsr2Optimized/OriginalFs"
             ZTest Always ZWrite Off Cull Off Blend Off
 
             HLSLPROGRAM
+            #pragma target 4.5
             #pragma vertex Vert
             #pragma fragment FragConvert
 
@@ -121,6 +122,7 @@ Shader "Hidden/Sgsr2Optimized/OriginalFs"
             ZTest Always ZWrite Off Cull Off Blend Off
 
             HLSLPROGRAM
+            #pragma target 4.5
             #pragma vertex Vert
             #pragma fragment FragUpscale
             #pragma multi_compile_fragment __ SGSR_FP16
