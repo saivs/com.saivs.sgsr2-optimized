@@ -147,6 +147,19 @@ Shader "Hidden/Sgsr2Optimized/UpscaleFrag"
                     rectboxweight += boxweight; \
                 }
 
+            // Ultra moving-camera tap: Lanczos accumulation only. The box
+            // statistics BOX_SAMPLE gathers per tap already sit precomputed
+            // in the guide, so accumulating them here would be paying twice.
+            #define ULTRA_TAP(colorexpr, offsx, offsy) \
+                { \
+                    hfloat3 samplecolor = colorexpr; \
+                    hfloat2 baseoffset = srcDelta + hfloat2(offsx, offsy); \
+                    hfloat baseoffset_dot = dot(baseoffset, baseoffset); \
+                    hfloat base = saturate(baseoffset_dot * hKernelbias2); \
+                    hfloat weight = FastLanczos(base); \
+                    Upsampledcw += hfloat4(samplecolor * weight, weight); \
+                }
+
             FragOut Frag(Varyings i)
             {
                 float2 renderSize = _RenderSizeInfo.xy;
@@ -309,30 +322,27 @@ Shader "Hidden/Sgsr2Optimized/UpscaleFrag"
                 hfloat3 rectboxmax;
 
 #if defined(SGSR_ULTRA)
-                // Ultra current-frame tap, one fetch either way. Still
-                // camera: a point Load — the jitter scans the texel phase by
-                // phase and the Lanczos-weighted EMA converges to the same
-                // sharp reconstruction as the multi-tap path. A bilinear tap
-                // converges to the image blurred by the HW tent filter
-                // instead (that was the soft distant edges vs normal mode —
-                // no amount of unsharp recovers an edge the reconstruction
-                // lost). In motion there is no accumulation to refine a point
-                // sample, so the bilinear filter is the better single-tap
-                // estimate there.
+                // Ultra current-frame taps. Still camera: NO color fetch at
+                // all — the guide's motion slot carries this texel's color
+                // (motion is identically zero), and the Lanczos-weighted EMA
+                // converges to the same sharp reconstruction as the multi-tap
+                // path because the jitter scans the texel phase by phase.
+                // In motion there is no accumulation to refine anything: a
+                // single bilinear tap reconstructs edges as the HW tent
+                // filter — visibly softer than every multi-tap variant, and
+                // unsharp cannot recover an edge the reconstruction lost. So
+                // the moving variant runs the same 5-tap Lanczos pattern as
+                // the reference moving path; only the box statistics stay
+                // precomputed in the guide.
 #if defined(SGSR_STILL)
-                // Still variant: the guide's motion slot carries this texel's
-                // color (11/11/10) — the display pass does NO color fetch at
-                // all, and no branch. Same-frame value, same chain as the old
-                // point Load, just one texture op fewer.
                 hfloat3 tapCenter = DecodeColor(gb.x);
 #else
-                float3 rawC = _SgsrColor.SampleLevel(sgsr_linear_clamp_sampler, Jitteruv, 0.0).xyz;
-                centerColorMax = max(max(rawC.x, rawC.y), rawC.z) + _SgsrParams.x;
-                hfloat3 rgbC = (hfloat3)(rawC / centerColorMax);
-                hfloat yC = hfloat(0.25) * (rgbC.x + hfloat(2.0) * rgbC.y + rgbC.z);
-                hfloat coB = saturate(hfloat(0.5) * rgbC.x + hfloat(0.5) - hfloat(0.5) * rgbC.z);
-                hfloat cgB = saturate(yC + coB - rgbC.x);
-                hfloat3 tapCenter = hfloat3(yC, coB - hfloat(0.5), cgB - hfloat(0.5));
+                float cmUltra;
+                hfloat3 tapCenter = FetchYCoCg(InputPos, centerColorMax);
+                hfloat3 tapUp     = FetchYCoCg(InputPos + int2( 0,  1), cmUltra);
+                hfloat3 tapRight  = FetchYCoCg(InputPos + int2( 1,  0), cmUltra);
+                hfloat3 tapLeft   = FetchYCoCg(InputPos + int2(-1,  0), cmUltra);
+                hfloat3 tapDown   = FetchYCoCg(InputPos + int2( 0, -1), cmUltra);
 #endif
 #elif defined(SGSR_PACKED)
                 // Packed input: the whole 5-tap plus pattern arrives in two
@@ -358,10 +368,7 @@ Shader "Hidden/Sgsr2Optimized/UpscaleFrag"
 
 #if defined(SGSR_ULTRA)
                 // Ultra: the rectification box was precomputed per render
-                // pixel (3x3, full quality) — one point tap. The single color
-                // tap is clamped into it directly; the weight floor keeps the
-                // accumulator alive when the output pixel lands far from the
-                // render texel center.
+                // pixel (3x3, full quality) — one point tap of the guide.
                 rectboxmin = DecodeColor(gb.z);
                 rectboxmax = DecodeColor(gb.w);
 
@@ -376,23 +383,39 @@ Shader "Hidden/Sgsr2Optimized/UpscaleFrag"
                     // fed the sharpened value back through history, so the
                     // unsharp reapplied itself every frame: a recursive
                     // amplifier for jitter noise. Kernel-weight modulation
-                    // still gates it, and fast motion fades it out — a
-                    // panning frame is mostly the raw bilinear tap, and
-                    // sharpening that only accentuates stair-stepping.
+                    // still gates it, and fast motion fades it out — the
+                    // kernel already widens with motion, and sharpening a
+                    // widened kernel only accentuates stair-stepping.
                     ultraSharpen = (hfloat)_SgsrParams.w * saturate(weight * hfloat(4.0))
                                  * (hfloat(1.0) - (hfloat)saturate(motion_viewport_len * 0.05));
 
 #if defined(SGSR_STILL)
-                    // Still: reprojection is exact, so let the EMA run long —
-                    // the single tap's jitter wobble averages out over ~14
-                    // frames instead of showing. Lighting changes still land
-                    // fast through the rectbox clamp.
+                    // Still: single guide-carried tap, no reconstruction
+                    // needed — reprojection is exact, so let the EMA run
+                    // long (weight * 0.3): the tap's jitter wobble averages
+                    // out over ~14 frames instead of showing. The weight
+                    // floor keeps the accumulator alive when the output
+                    // pixel lands far from the render texel center.
                     weight *= hfloat(0.3);
-#endif
-
                     Upsampledcw = hfloat4(
                         clamp(tapCenter, rectboxmin - hfloat(0.05), rectboxmax + hfloat(0.05)),
                         weight);
+#else
+                    // Moving: 5-tap Lanczos reconstruction — same kernel as
+                    // the reference moving path, so edges in motion match the
+                    // multi-tap variants instead of the HW tent filter. The
+                    // negative Lanczos lobe needs the true (unfloored) center
+                    // weight, and the guide box clamps the normalized sum.
+                    hfloat wCenter = FastLanczos(base);
+                    Upsampledcw = hfloat4(tapCenter * wCenter, wCenter);
+                    ULTRA_TAP(tapUp,     0,  1)
+                    ULTRA_TAP(tapRight,  1,  0)
+                    ULTRA_TAP(tapLeft,  -1,  0)
+                    ULTRA_TAP(tapDown,   0, -1)
+                    Upsampledcw.xyz = clamp(Upsampledcw.xyz / Upsampledcw.w,
+                        rectboxmin - hfloat(0.05), rectboxmax + hfloat(0.05));
+                    Upsampledcw.w = Upsampledcw.w * hfloat(1.0 / 3.0);
+#endif
                 }
 #else
                 {
